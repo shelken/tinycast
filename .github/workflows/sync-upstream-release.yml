@@ -172,7 +172,8 @@ jobs:
         working-directory: ${{ runner.temp }}/build
         run: |
           echo "test" > "$RUNNER_TEMP/failed_stage"
-          ./Scripts/run-tests.sh
+          ./Scripts/run-tests.sh scopes-test
+          ./Scripts/run-tests.sh updates-test
 
       - name: Lint
         if: steps.plan.outputs.skip != 'true'
