@@ -159,19 +159,12 @@ jobs:
           cd "$BUILD_DIR"
           for p in "$GITHUB_WORKSPACE/patches/"*.patch; do
             pname="$(basename "$p")"
-            echo "Evaluating patch $pname..."
-            if git apply --check "$p" >/dev/null 2>&1; then
-              git apply "$p"
-              echo "Successfully applied $pname"
-            else
-              if [[ "$pname" =~ ^0001 || "$pname" =~ ^0002 ]]; then
-                echo "::error::Mandatory patch $pname failed to apply cleanly to ${TARGET_TAG}."
-                git apply --check "$p" || true
-                exit 1
-              else
-                echo "::warning::Optional patch $pname skipped (not applicable to ${TARGET_TAG})."
-              fi
+            echo "Applying patch $pname..."
+            if ! git apply "$p"; then
+              echo "::error::Patch $pname failed to apply cleanly to ${TARGET_TAG}."
+              exit 1
             fi
+            echo "Successfully applied $pname"
           done
 
       - name: Run test suite
