@@ -1,0 +1,114 @@
+diff --git a/Tests/scopes-test.swift b/Tests/scopes-test.swift
+index 2f2f9e4..e3950a0 100644
+--- a/Tests/scopes-test.swift
++++ b/Tests/scopes-test.swift
+@@ -2,7 +2,7 @@ import Foundation
+ 
+ @main
+ struct ScopesTest {
+-    static func main() {
++    static func main() throws {
+         let fm = FileManager.default
+         let root = fm.temporaryDirectory
+             .appendingPathComponent("tinycast-scopes-\(UUID().uuidString)")
+@@ -33,13 +33,39 @@ struct ScopesTest {
+         let deep = vendor.appendingPathComponent("Deeper")
+         makeDir(deep.appendingPathComponent("TooDeep.app"))
+ 
+-        let found = SearchScopes.appBundles(in: [apps.path]).map(\.lastPathComponent)
++        let managedApps = root.appendingPathComponent("Managed Apps")
++        makeDir(managedApps.appendingPathComponent("Managed.app"))
++        let managedAppsLink = apps.appendingPathComponent("Home Manager Apps")
++        try fm.createSymbolicLink(at: managedAppsLink, withDestinationURL: managedApps)
++        let managedAppLink = root.appendingPathComponent("Managed Link.app")
++        try fm.createSymbolicLink(
++            at: managedAppLink,
++            withDestinationURL: managedApps.appendingPathComponent("Managed.app"))
++        let brokenAppLink = apps.appendingPathComponent("Broken.app")
++        try fm.createSymbolicLink(
++            at: brokenAppLink,
++            withDestinationURL: root.appendingPathComponent("Missing.app"))
++
++        let foundURLs = SearchScopes.appBundles(in: [apps.path])
++        let found = foundURLs.map(\.lastPathComponent)
+         check(
+-            "direct and one-level-nested .app children are indexed",
+-            Set(found) == ["Alpha.app", "Beta.app", "Nested.app"])
++            "direct, nested, and symlinked .app children are indexed",
++            Set(found) == ["Alpha.app", "Beta.app", "Managed.app", "Nested.app"])
+         check("non-app children are skipped", !found.contains("Notes.txt"))
+         check("hidden bundles are skipped", !found.contains(".Hidden.app"))
+         check("bundles nested two levels deep are not indexed", !found.contains("TooDeep.app"))
++        let logicalManagedApp = managedAppsLink.appendingPathComponent("Managed.app")
++        let physicalManagedApp = managedApps.appendingPathComponent("Managed.app")
++        check(
++            "apps under a symlink keep their logical paths",
++            foundURLs.contains(logicalManagedApp) && !foundURLs.contains(physicalManagedApp))
++        check("broken .app symlinks are skipped", !foundURLs.contains(brokenAppLink))
++        check(
++            "a symlinked directory works as its own scope",
++            SearchScopes.appBundles(in: [managedAppsLink.path]) == [logicalManagedApp])
++        check(
++            "an .app symlink works as its own scope",
++            SearchScopes.appBundles(in: [managedAppLink.path]) == [managedAppLink])
+         check(
+             "a deeply nested folder works as its own scope",
+             SearchScopes.appBundles(in: [deep.path]).map(\.lastPathComponent) == ["TooDeep.app"])
+diff --git a/Tinycast/Features/Launcher/Model/SearchScopes.swift b/Tinycast/Features/Launcher/Model/SearchScopes.swift
+index c1b0fb2..8576c34 100644
+--- a/Tinycast/Features/Launcher/Model/SearchScopes.swift
++++ b/Tinycast/Features/Launcher/Model/SearchScopes.swift
+@@ -47,22 +47,43 @@ enum SearchScopes {
+         return result
+     }
+ 
+-    /// `.app` is a leaf here — never descended into, only real subfolders recurse.
++    private static let scanKeys: [URLResourceKey] = [.isDirectoryKey, .isSymbolicLinkKey]
++    private static let scanKeySet: Set<URLResourceKey> = [.isDirectoryKey, .isSymbolicLinkKey]
++
++    /// `.app` is a leaf here — never descended into.
+     private static func appBundles(under url: URL, subfolderDepth: Int) -> [URL] {
++        let fm = FileManager.default
+         guard
+-            let items = try? FileManager.default.contentsOfDirectory(
+-                at: url, includingPropertiesForKeys: [.isDirectoryKey], options: [.skipsHiddenFiles]
+-            )
++            let items = (try? fm.contentsOfDirectory(
++                at: url, includingPropertiesForKeys: scanKeys, options: [.skipsHiddenFiles]))
++                ?? (try? fm.contentsOfDirectory(
++                    at: url.resolvingSymlinksInPath(),
++                    includingPropertiesForKeys: scanKeys,
++                    options: [.skipsHiddenFiles]))
+         else { return [] }
+ 
+         var result: [URL] = []
+         for item in items {
+-            if item.pathExtension == "app" {
+-                result.append(item)
+-            } else if subfolderDepth > 0,
+-                (try? item.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true
+-            {
+-                result.append(contentsOf: appBundles(under: item, subfolderDepth: subfolderDepth - 1))
++            let logicalItem = url.appendingPathComponent(item.lastPathComponent)
++            let isApp = logicalItem.pathExtension == "app"
++            let values = try? item.resourceValues(forKeys: scanKeySet)
++            let isSymlink = values?.isSymbolicLink == true
++
++            if isApp {
++                if !isSymlink || fm.fileExists(atPath: logicalItem.path) {
++                    result.append(logicalItem)
++                }
++            } else if subfolderDepth > 0 {
++                if values?.isDirectory == true {
++                    result.append(
++                        contentsOf: appBundles(under: logicalItem, subfolderDepth: subfolderDepth - 1))
++                } else if isSymlink,
++                    (try? logicalItem.resolvingSymlinksInPath().resourceValues(forKeys: [.isDirectoryKey]))?
++                        .isDirectory == true
++                {
++                    result.append(
++                        contentsOf: appBundles(under: logicalItem, subfolderDepth: subfolderDepth - 1))
++                }
+             }
+         }
+         return result
