@@ -1,0 +1,451 @@
+name: Sync Upstream Release
+
+run-name: "Sync Upstream Release · ${{ github.event.inputs.upstream_tag || 'auto' }} #${{ github.run_number }}"
+
+on:
+  schedule:
+    - cron: "23 * * * *"
+  workflow_dispatch:
+    inputs:
+      upstream_tag:
+        description: "Upstream tag to sync (e.g. v0.10.12-beta.80 for bootstrap, or vX.Y.Z for stable)"
+        required: false
+        type: string
+
+concurrency:
+  group: sync-upstream-release
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  issues: write
+  actions: write
+
+jobs:
+  sync:
+    runs-on: macos-26
+    steps:
+      - name: Select Xcode 26
+        run: |
+          XCODE_PATH="$(ls -d /Applications/Xcode_26*.app 2>/dev/null | sort -V | tail -n1)"
+          if [ -z "$XCODE_PATH" ]; then
+            echo "::error::No Xcode 26.x found on this runner. Installed Xcodes:"
+            ls /Applications | grep -i xcode || true
+            exit 1
+          fi
+          echo "Using $XCODE_PATH"
+          echo "DEVELOPER_DIR=$XCODE_PATH/Contents/Developer" >> "$GITHUB_ENV"
+
+      - name: Checkout fork main
+        uses: actions/checkout@v7
+        with:
+          ref: main
+          fetch-depth: 0
+          token: ${{ github.token }}
+
+      - name: Install SwiftLint
+        run: |
+          command -v swiftlint >/dev/null || brew install swiftlint
+
+      - name: Determine target release and check idempotency
+        id: plan
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_TAG: ${{ github.event.inputs.upstream_tag }}
+        run: |
+          echo "resolve_target" > "$RUNNER_TEMP/failed_stage"
+
+          is_newer_than_baseline() {
+            local tag="$1"
+            local baseline="v0.10.5"
+            [ "$tag" != "$baseline" ] && [ "$(printf "%s\n%s\n" "$baseline" "$tag" | sort -V | tail -n1)" = "$tag" ]
+          }
+
+          RAW_INPUT="$(echo "${INPUT_TAG:-}" | tr -d '[:space:]')"
+          TARGET_TAG=""
+          IS_PRERELEASE="false"
+
+          if [ -n "$RAW_INPUT" ]; then
+            if [ "$RAW_INPUT" = "v0.10.12-beta.80" ]; then
+              TARGET_TAG="v0.10.12-beta.80"
+              IS_PRERELEASE="true"
+            elif [[ "$RAW_INPUT" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              TARGET_TAG="$RAW_INPUT"
+              IS_PRERELEASE="false"
+            else
+              echo "::error::Invalid upstream_tag '${RAW_INPUT}'. Allowed: 'v0.10.12-beta.80' or format 'vMAJOR.MINOR.PATCH'."
+              exit 1
+            fi
+
+            UPSTREAM_INFO="$(gh api "repos/abue-ammar/tinycast/releases/tags/${TARGET_TAG}" 2>/dev/null || true)"
+            if [ -z "$UPSTREAM_INFO" ]; then
+              echo "::error::Upstream release for tag '${TARGET_TAG}' was not found in abue-ammar/tinycast."
+              exit 1
+            fi
+
+            IS_DRAFT="$(echo "$UPSTREAM_INFO" | jq -r '.draft')"
+            if [ "$IS_DRAFT" = "true" ]; then
+              echo "::error::Upstream release '${TARGET_TAG}' is a draft."
+              exit 1
+            fi
+
+            UPSTREAM_PRERELEASE="$(echo "$UPSTREAM_INFO" | jq -r '.prerelease')"
+            if [ "$TARGET_TAG" != "v0.10.12-beta.80" ] && [ "$UPSTREAM_PRERELEASE" = "true" ]; then
+              echo "::error::Upstream release '${TARGET_TAG}' is a prerelease. Only stable releases (or bootstrap v0.10.12-beta.80) are allowed."
+              exit 1
+            fi
+          else
+            # Automatic path: fetch non-draft, non-prerelease releases matching vX.Y.Z, sorted earliest published first
+            CANDIDATES="$(gh api "repos/abue-ammar/tinycast/releases?per_page=100" \
+              --jq '[.[] | select(.draft | not) | select(.prerelease | not) | select(.tag_name | test("^v[0-9]+\\.[0-9]+\\.[0-9]+$"))] | sort_by(.published_at) | .[] | .tag_name' 2>/dev/null || true)"
+
+            for tag in $CANDIDATES; do
+              if is_newer_than_baseline "$tag"; then
+                if ! gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+                  TARGET_TAG="$tag"
+                  IS_PRERELEASE="false"
+                  break
+                fi
+              fi
+            done
+
+            if [ -z "$TARGET_TAG" ]; then
+              echo "No upstream stable release pending sync beyond baseline v0.10.5."
+              echo "skip=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          fi
+
+          VERSION="${TARGET_TAG#v}"
+          echo "Target tag: ${TARGET_TAG} (version: ${VERSION}, prerelease: ${IS_PRERELEASE})"
+          echo "target_tag=${TARGET_TAG}" >> "$GITHUB_OUTPUT"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "is_prerelease=${IS_PRERELEASE}" >> "$GITHUB_OUTPUT"
+
+          # Idempotency check: does fork release already exist?
+          if gh release view "$TARGET_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Fork release '${TARGET_TAG}' already exists. Checking remote tag commit and assets..."
+            REMOTE_TAG_REF="$(git ls-remote origin "refs/tags/${TARGET_TAG}^{}" 2>/dev/null | awk '{print $1}')"
+            if [ -z "$REMOTE_TAG_REF" ]; then
+              REMOTE_TAG_REF="$(git ls-remote origin "refs/tags/${TARGET_TAG}" 2>/dev/null | awk '{print $1}')"
+            fi
+
+            if [ -n "$REMOTE_TAG_REF" ]; then
+              if git merge-base --is-ancestor "$REMOTE_TAG_REF" HEAD; then
+                ASSETS="$(gh release view "$TARGET_TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name' 2>/dev/null || true)"
+                if echo "$ASSETS" | grep -q "^Tinycast-${VERSION}\.dmg$" && echo "$ASSETS" | grep -q "^Tinycast-${VERSION}\.zip$"; then
+                  echo "Release ${TARGET_TAG} already exists on fork, points to commit ${REMOTE_TAG_REF} in HEAD history, and contains all required assets. Idempotent no-op."
+                  echo "skip=true" >> "$GITHUB_OUTPUT"
+                  exit 0
+                else
+                  echo "Fork release exists but required assets are missing. Will rebuild and complete release."
+                fi
+              else
+                echo "::error::Remote tag '${TARGET_TAG}' points to ${REMOTE_TAG_REF}, which is not an ancestor of HEAD. Force-move is forbidden."
+                exit 1
+              fi
+            fi
+          else
+            # Release does not exist, but does remote tag exist?
+            REMOTE_TAG_REF="$(git ls-remote origin "refs/tags/${TARGET_TAG}^{}" 2>/dev/null | awk '{print $1}')"
+            if [ -z "$REMOTE_TAG_REF" ]; then
+              REMOTE_TAG_REF="$(git ls-remote origin "refs/tags/${TARGET_TAG}" 2>/dev/null | awk '{print $1}')"
+            fi
+            if [ -n "$REMOTE_TAG_REF" ]; then
+              if ! git merge-base --is-ancestor "$REMOTE_TAG_REF" HEAD; then
+                echo "::error::Remote tag '${TARGET_TAG}' already exists and points to ${REMOTE_TAG_REF}, which is not in HEAD history. Force-move is forbidden."
+                exit 1
+              fi
+            fi
+          fi
+
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+
+      - name: Fetch upstream tag and merge if necessary
+        id: fetch
+        if: steps.plan.outputs.skip != 'true'
+        env:
+          TARGET_TAG: ${{ steps.plan.outputs.target_tag }}
+        run: |
+          echo "fetch_upstream" > "$RUNNER_TEMP/failed_stage"
+
+          git remote add upstream https://github.com/abue-ammar/tinycast.git 2>/dev/null || true
+          git fetch upstream "refs/tags/${TARGET_TAG}:refs/remotes/upstream/tags/${TARGET_TAG}" --no-tags
+
+          UPSTREAM_SHA="$(git rev-parse "refs/remotes/upstream/tags/${TARGET_TAG}^{commit}")"
+          echo "upstream_sha=${UPSTREAM_SHA}" >> "$GITHUB_OUTPUT"
+          echo "Upstream commit for ${TARGET_TAG}: ${UPSTREAM_SHA}"
+
+          echo "merge" > "$RUNNER_TEMP/failed_stage"
+          if git merge-base --is-ancestor "$UPSTREAM_SHA" HEAD; then
+            echo "Upstream commit ${UPSTREAM_SHA} is already an ancestor of HEAD. No merge needed."
+          else
+            echo "Merging upstream tag ${TARGET_TAG} (${UPSTREAM_SHA}) into HEAD..."
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            if ! git merge --no-ff -m "Merge upstream ${TARGET_TAG}" "$UPSTREAM_SHA"; then
+              echo "::error::Merge conflict encountered while merging ${TARGET_TAG}."
+              exit 1
+            fi
+            echo "Successfully merged upstream ${TARGET_TAG}."
+          fi
+
+      - name: Run test suite
+        if: steps.plan.outputs.skip != 'true'
+        run: |
+          echo "test" > "$RUNNER_TEMP/failed_stage"
+          ./Scripts/run-tests.sh
+
+      - name: Lint
+        if: steps.plan.outputs.skip != 'true'
+        env:
+          SWIFTLINT_REPORTER: github-actions-logging
+        run: |
+          echo "lint" > "$RUNNER_TEMP/failed_stage"
+          ./Scripts/lint.sh
+
+      - name: Model purity check
+        if: steps.plan.outputs.skip != 'true'
+        run: |
+          echo "purity_check" > "$RUNNER_TEMP/failed_stage"
+          PURITY_VIOLATIONS="$(grep -rln 'import AppKit\|import SwiftUI\|import Cocoa' Tinycast/Features/*/Model/ 2>/dev/null || true)"
+          if [ -n "$PURITY_VIOLATIONS" ]; then
+            echo "::error::Model purity check failed. Violations:"
+            echo "$PURITY_VIOLATIONS"
+            exit 1
+          fi
+
+      - name: Debug build
+        if: steps.plan.outputs.skip != 'true'
+        run: |
+          echo "debug_build" > "$RUNNER_TEMP/failed_stage"
+          xcodebuild build -project Tinycast.xcodeproj -scheme Tinycast -configuration Debug CODE_SIGNING_ALLOWED=NO
+
+      - name: Import signing certificate
+        if: steps.plan.outputs.skip != 'true'
+        env:
+          P12_BASE64: ${{ secrets.SIGNING_P12_BASE64 }}
+          P12_PASSWORD: ${{ secrets.SIGNING_P12_PASSWORD }}
+        run: |
+          echo "import_signing" > "$RUNNER_TEMP/failed_stage"
+          if [ -z "${P12_BASE64}" ] || [ -z "${P12_PASSWORD}" ]; then
+            echo "::error::SIGNING_P12_BASE64 or SIGNING_P12_PASSWORD secret is missing."
+            exit 1
+          fi
+
+          KEYCHAIN="$RUNNER_TEMP/signing.keychain-db"
+          KPW="$(openssl rand -base64 24)"
+          echo "${P12_BASE64}" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security create-keychain -p "$KPW" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$KPW" "$KEYCHAIN"
+          security import "$RUNNER_TEMP/cert.p12" -k "$KEYCHAIN" -P "${P12_PASSWORD}" -A -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$KPW" "$KEYCHAIN" >/dev/null
+          security list-keychains -d user -s "$KEYCHAIN" $(security list-keychains -d user | sed 's/"//g')
+          rm -f "$RUNNER_TEMP/cert.p12"
+
+      - name: Build Release app
+        if: steps.plan.outputs.skip != 'true'
+        env:
+          VERSION: ${{ steps.plan.outputs.version }}
+          BUILD_NUMBER: ${{ github.run_number }}
+        run: |
+          echo "release_build" > "$RUNNER_TEMP/failed_stage"
+          xcodebuild -project Tinycast.xcodeproj -scheme Tinycast -configuration Release \
+            -derivedDataPath "$RUNNER_TEMP/DerivedData" \
+            ARCHS=arm64 ONLY_ACTIVE_ARCH=NO \
+            CODE_SIGN_STYLE=Manual CODE_SIGN_IDENTITY="Tinycast Self-Signed" \
+            OTHER_CODE_SIGN_FLAGS="--timestamp=none" \
+            PRODUCT_NAME="Tinycast" PRODUCT_BUNDLE_IDENTIFIER="com.tinycast.app" \
+            MARKETING_VERSION="$VERSION" CURRENT_PROJECT_VERSION="$BUILD_NUMBER" \
+            build
+
+      - name: Assert arm64-only
+        if: steps.plan.outputs.skip != 'true'
+        run: |
+          echo "assert_arm64" > "$RUNNER_TEMP/failed_stage"
+          BIN="$RUNNER_TEMP/DerivedData/Build/Products/Release/Tinycast.app/Contents/MacOS/Tinycast"
+          SLICES="$(lipo -archs "$BIN")"
+          if [ "$SLICES" != "arm64" ]; then
+            echo "::error::Expected arm64 binary alone, got '$SLICES'"
+            exit 1
+          fi
+
+      - name: Package DMG and ZIP
+        if: steps.plan.outputs.skip != 'true'
+        env:
+          VERSION: ${{ steps.plan.outputs.version }}
+        run: |
+          echo "package" > "$RUNNER_TEMP/failed_stage"
+          APP="$RUNNER_TEMP/DerivedData/Build/Products/Release/Tinycast.app"
+          STAGE="$(mktemp -d)"
+          cp -R "$APP" "$STAGE/"
+          ln -s /Applications "$STAGE/Applications"
+          mkdir -p dist
+          diskutil image create from "$STAGE" --format UDZO --volumeName "Tinycast" "dist/Tinycast-${VERSION}.dmg"
+          ditto -c -k --keepParent --sequesterRsrc "$APP" "dist/Tinycast-${VERSION}.zip"
+
+      - name: Push fork main and tag
+        if: steps.plan.outputs.skip != 'true'
+        env:
+          TARGET_TAG: ${{ steps.plan.outputs.target_tag }}
+        run: |
+          echo "push" > "$RUNNER_TEMP/failed_stage"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          if ! git rev-parse "refs/tags/${TARGET_TAG}" >/dev/null 2>&1; then
+            git tag -a "${TARGET_TAG}" -m "Release ${TARGET_TAG}"
+          fi
+
+          if git ls-remote origin "refs/tags/${TARGET_TAG}" | grep -q "${TARGET_TAG}"; then
+            echo "Tag ${TARGET_TAG} already exists on origin. Pushing main branch..."
+            git push origin HEAD:refs/heads/main
+          else
+            echo "Atomically pushing main and tag ${TARGET_TAG}..."
+            git push --atomic origin HEAD:refs/heads/main "refs/tags/${TARGET_TAG}"
+          fi
+
+      - name: Compose release notes
+        id: notes
+        if: steps.plan.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TARGET_TAG: ${{ steps.plan.outputs.target_tag }}
+          VERSION: ${{ steps.plan.outputs.version }}
+          IS_PRERELEASE: ${{ steps.plan.outputs.is_prerelease }}
+        run: |
+          echo "compose_notes" > "$RUNNER_TEMP/failed_stage"
+          NOTES_FILE="$RUNNER_TEMP/release-notes.md"
+          UPSTREAM_BODY="$(gh api "repos/abue-ammar/tinycast/releases/tags/${TARGET_TAG}" --jq '.body // ""' 2>/dev/null || true)"
+          SUMMARY="$(printf '%s\n' "$UPSTREAM_BODY" | sed -e '/<!-- tinycast:install -->/,$d' | sed -e 's/[[:space:]]*$//')"
+          if [ -z "$SUMMARY" ]; then
+            SUMMARY="Upstream release ${TARGET_TAG}."
+          fi
+
+          CHANNEL="stable"
+          if [ "$IS_PRERELEASE" = "true" ]; then
+            CHANNEL="beta"
+          fi
+
+          {
+            printf '%s\n\n' "$SUMMARY"
+            printf '%s\n\n' "<!-- tinycast:install -->"
+            printf '**Channel:** %s · **Version:** %s · **Bundle ID:** `%s`\n' "$CHANNEL" "$VERSION" "com.tinycast.app"
+            printf 'Built from %s.\n' "$(git rev-parse HEAD)"
+            printf 'Synced from upstream [abue-ammar/tinycast@%s](https://github.com/abue-ammar/tinycast/releases/tag/%s).\n\n' "$TARGET_TAG" "$TARGET_TAG"
+            printf '**Recommended:** install via Homebrew:\n'
+            printf '```sh\nbrew install --cask shelken/tap/tinycast\n```\n\n'
+            printf 'This build is self-signed. If you download the DMG directly instead of using Homebrew, macOS will refuse to open it until you clear the quarantine flag once:\n'
+            printf '```sh\nxattr -dr com.apple.quarantine "/Applications/Tinycast.app"\n```\n'
+          } > "$NOTES_FILE"
+          echo "notes_file=$NOTES_FILE" >> "$GITHUB_OUTPUT"
+
+      - name: Publish GitHub Release
+        if: steps.plan.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TARGET_TAG: ${{ steps.plan.outputs.target_tag }}
+          VERSION: ${{ steps.plan.outputs.version }}
+          IS_PRERELEASE: ${{ steps.plan.outputs.is_prerelease }}
+          NOTES_FILE: ${{ steps.notes.outputs.notes_file }}
+        run: |
+          echo "publish_release" > "$RUNNER_TEMP/failed_stage"
+
+          PRERELEASE_FLAG=""
+          if [ "$IS_PRERELEASE" = "true" ]; then
+            PRERELEASE_FLAG="--prerelease"
+          fi
+
+          if gh release view "$TARGET_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release ${TARGET_TAG} already exists on GitHub. Uploading missing assets..."
+            gh release upload "$TARGET_TAG" \
+              "dist/Tinycast-${VERSION}.dmg" \
+              "dist/Tinycast-${VERSION}.zip" \
+              --repo "$GITHUB_REPOSITORY" \
+              --clobber=false || true
+          else
+            echo "Creating GitHub Release ${TARGET_TAG}..."
+            gh release create "$TARGET_TAG" \
+              "dist/Tinycast-${VERSION}.dmg" \
+              "dist/Tinycast-${VERSION}.zip" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "Tinycast ${VERSION}" \
+              --notes-file "$NOTES_FILE" \
+              $PRERELEASE_FLAG
+          fi
+
+      - name: Close resolved failure issue
+        if: success() && steps.plan.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TARGET_TAG: ${{ steps.plan.outputs.target_tag }}
+        run: |
+          ISSUE_TITLE="[upstream-sync] ${TARGET_TAG} failed"
+          EXISTING_ISSUE="$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --search "\"${ISSUE_TITLE}\" in:title" --json number --jq '.[0].number // empty' 2>/dev/null || true)"
+          if [ -n "$EXISTING_ISSUE" ]; then
+            echo "Closing resolved issue #${EXISTING_ISSUE}..."
+            gh issue close "$EXISTING_ISSUE" --repo "$GITHUB_REPOSITORY" \
+              --comment "Resolved successfully by run ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          fi
+
+      - name: Check backlog and trigger next sync
+        if: success() && steps.plan.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          is_newer_than_baseline() {
+            local tag="$1"
+            local baseline="v0.10.5"
+            [ "$tag" != "$baseline" ] && [ "$(printf "%s\n%s\n" "$baseline" "$tag" | sort -V | tail -n1)" = "$tag" ]
+          }
+          CANDIDATES="$(gh api "repos/abue-ammar/tinycast/releases?per_page=100" \
+            --jq '[.[] | select(.draft | not) | select(.prerelease | not) | select(.tag_name | test("^v[0-9]+\\.[0-9]+\\.[0-9]+$"))] | sort_by(.published_at) | .[] | .tag_name' 2>/dev/null || true)"
+          HAS_BACKLOG=false
+          for tag in $CANDIDATES; do
+            if is_newer_than_baseline "$tag"; then
+              if ! gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+                HAS_BACKLOG=true
+                echo "Found backlog unreleased upstream tag: $tag"
+                break
+              fi
+            fi
+          done
+          if [ "$HAS_BACKLOG" = "true" ]; then
+            echo "Triggering next sync-upstream-release run..."
+            gh workflow run sync-upstream-release.yml --repo "$GITHUB_REPOSITORY"
+          else
+            echo "No pending upstream releases in backlog."
+          fi
+
+      - name: Handle failure
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TARGET_TAG: ${{ steps.plan.outputs.target_tag || github.event.inputs.upstream_tag || 'unknown' }}
+          UPSTREAM_SHA: ${{ steps.fetch.outputs.upstream_sha || 'unknown' }}
+        run: |
+          FAILED_STAGE="$(cat "$RUNNER_TEMP/failed_stage" 2>/dev/null || echo "unknown")"
+          RUN_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          CONFLICT_FILES="$(git diff --name-only --diff-filter=U 2>/dev/null || true)"
+
+          ISSUE_TITLE="[upstream-sync] ${TARGET_TAG} failed"
+
+          BODY="$(printf '## Upstream Sync Failure: `%s`\n\n- **Failed Stage:** `%s`\n- **Upstream Release:** https://github.com/abue-ammar/tinycast/releases/tag/%s\n- **Upstream SHA:** `%s`\n- **Actions Run URL:** %s\n' \
+            "$TARGET_TAG" "$FAILED_STAGE" "$TARGET_TAG" "$UPSTREAM_SHA" "$RUN_URL")"
+
+          if [ -n "$CONFLICT_FILES" ]; then
+            BODY="$(printf '%s\n\n### Conflicted Files:\n```\n%s\n```\n' "$BODY" "$CONFLICT_FILES")"
+          fi
+
+          BODY="$(printf '%s\n\n### Remediation:\n1. Check out a fix branch from fork `main`.\n2. Fetch and merge upstream tag: `git fetch https://github.com/abue-ammar/tinycast.git refs/tags/%s && git merge FETCH_HEAD`.\n3. Resolve any conflicts or test failures.\n4. Merge back to fork `main` via PR with a merge commit.\n5. Re-run this workflow.\n' "$BODY" "$TARGET_TAG")"
+
+          EXISTING_ISSUE="$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --search "\"${ISSUE_TITLE}\" in:title" --json number --jq '.[0].number // empty' 2>/dev/null || true)"
+
+          if [ -n "$EXISTING_ISSUE" ]; then
+            echo "Commenting on existing issue #${EXISTING_ISSUE}..."
+            gh issue comment "$EXISTING_ISSUE" --repo "$GITHUB_REPOSITORY" --body "$BODY"
+          else
+            echo "Creating new issue '${ISSUE_TITLE}'..."
+            gh issue create --repo "$GITHUB_REPOSITORY" --title "$ISSUE_TITLE" --body "$BODY"
+          fi

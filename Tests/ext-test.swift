@@ -906,7 +906,10 @@ struct ExtensionTests {
         await runtime.start(
             session: "sSwift", code: command, file: URL(fileURLWithPath: "/tmp/swift-helper.js"),
             mode: .view, context: launchContext())
-        await settle(1200)
+        for _ in 0..<40 {
+            if let md = recorder.trees.last?.activeRoot?.string("markdown"), md != "pending" { break }
+            await settle(100)
+        }
 
         let mode = (try? FileManager.default.attributesOfItem(atPath: helper.path))
             .flatMap { $0[.posixPermissions] as? NSNumber }
