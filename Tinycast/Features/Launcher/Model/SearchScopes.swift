@@ -47,22 +47,43 @@ enum SearchScopes {
         return result
     }
 
-    /// `.app` is a leaf here — never descended into, only real subfolders recurse.
+    private static let scanKeys: [URLResourceKey] = [.isDirectoryKey, .isSymbolicLinkKey]
+    private static let scanKeySet: Set<URLResourceKey> = [.isDirectoryKey, .isSymbolicLinkKey]
+
+    /// `.app` is a leaf here — never descended into.
     private static func appBundles(under url: URL, subfolderDepth: Int) -> [URL] {
+        let fm = FileManager.default
         guard
-            let items = try? FileManager.default.contentsOfDirectory(
-                at: url, includingPropertiesForKeys: [.isDirectoryKey], options: [.skipsHiddenFiles]
-            )
+            let items = (try? fm.contentsOfDirectory(
+                at: url, includingPropertiesForKeys: scanKeys, options: [.skipsHiddenFiles]))
+                ?? (try? fm.contentsOfDirectory(
+                    at: url.resolvingSymlinksInPath(),
+                    includingPropertiesForKeys: scanKeys,
+                    options: [.skipsHiddenFiles]))
         else { return [] }
 
         var result: [URL] = []
         for item in items {
-            if item.pathExtension == "app" {
-                result.append(item)
-            } else if subfolderDepth > 0,
-                (try? item.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true
-            {
-                result.append(contentsOf: appBundles(under: item, subfolderDepth: subfolderDepth - 1))
+            let logicalItem = url.appendingPathComponent(item.lastPathComponent)
+            let isApp = logicalItem.pathExtension == "app"
+            let values = try? item.resourceValues(forKeys: scanKeySet)
+            let isSymlink = values?.isSymbolicLink == true
+
+            if isApp {
+                if !isSymlink || fm.fileExists(atPath: logicalItem.path) {
+                    result.append(logicalItem)
+                }
+            } else if subfolderDepth > 0 {
+                if values?.isDirectory == true {
+                    result.append(
+                        contentsOf: appBundles(under: logicalItem, subfolderDepth: subfolderDepth - 1))
+                } else if isSymlink,
+                    (try? logicalItem.resolvingSymlinksInPath().resourceValues(forKeys: [.isDirectoryKey]))?
+                        .isDirectory == true
+                {
+                    result.append(
+                        contentsOf: appBundles(under: logicalItem, subfolderDepth: subfolderDepth - 1))
+                }
             }
         }
         return result
