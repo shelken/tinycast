@@ -125,7 +125,9 @@ jobs:
           # Idempotency check: does fork release already exist with complete assets?
           if gh release view "$TARGET_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             ASSETS="$(gh release view "$TARGET_TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name' 2>/dev/null || true)"
-            if echo "$ASSETS" | grep -q "^Tinycast-${VERSION}\.dmg$" && echo "$ASSETS" | grep -q "^Tinycast-${VERSION}\.zip$"; then
+            if echo "$ASSETS" | grep -q "^Tinycast-${VERSION}\.dmg$" \
+              && echo "$ASSETS" | grep -q "^Tinycast-${VERSION}\.zip$" \
+              && echo "$ASSETS" | grep -q "^Tinycast-${VERSION}-Source\.tar\.gz$"; then
               echo "Release ${TARGET_TAG} already exists on fork with all required assets. Idempotent no-op."
               echo "skip=true" >> "$GITHUB_OUTPUT"
               exit 0
@@ -254,7 +256,7 @@ jobs:
             exit 1
           fi
 
-      - name: Package DMG and ZIP
+      - name: Package DMG, ZIP and patched source
         if: steps.plan.outputs.skip != 'true'
         env:
           VERSION: ${{ steps.plan.outputs.version }}
@@ -269,21 +271,31 @@ jobs:
           ditto -c -k --keepParent --sequesterRsrc "$APP" "$GITHUB_WORKSPACE/dist/Tinycast-${VERSION}.zip"
           rm -rf "$STAGE"
 
-      - name: Commit and push release tag
+          # Ship the tree the binary came from: upstream plus patches, no history.
+          cd "$RUNNER_TEMP/build"
+          git add -u
+          git archive --format=tar.gz --prefix="Tinycast-${VERSION}/" \
+            -o "$GITHUB_WORKSPACE/dist/Tinycast-${VERSION}-Source.tar.gz" "$(git write-tree)"
+
+      - name: Create release tag on fork main
+        id: tag
         if: steps.plan.outputs.skip != 'true'
-        working-directory: ${{ runner.temp }}/build
         env:
+          GH_TOKEN: ${{ github.token }}
           TARGET_TAG: ${{ steps.plan.outputs.target_tag }}
         run: |
-          echo "push_tag" > "$RUNNER_TEMP/failed_stage"
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git commit -am "Release ${TARGET_TAG} with downstream patches"
-          RELEASE_COMMIT="$(git rev-parse HEAD)"
-          echo "Release commit for ${TARGET_TAG}: ${RELEASE_COMMIT}"
+          echo "create_tag" > "$RUNNER_TEMP/failed_stage"
 
-          # Push tag directly pointing to the patched commit
-          git push origin "$RELEASE_COMMIT:refs/tags/${TARGET_TAG}" --force
+          # The tag names the revision whose patches/ built this release; upstream history is never pushed.
+          PATCH_SHA="$(git -C "$GITHUB_WORKSPACE" rev-parse HEAD)"
+          echo "patch_sha=${PATCH_SHA}" >> "$GITHUB_OUTPUT"
+
+          if gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${TARGET_TAG}" >/dev/null 2>&1; then
+            gh api -X PATCH "repos/${GITHUB_REPOSITORY}/git/refs/tags/${TARGET_TAG}" -F sha="$PATCH_SHA" -F force=true >/dev/null
+          else
+            gh api "repos/${GITHUB_REPOSITORY}/git/refs" -f ref="refs/tags/${TARGET_TAG}" -f sha="$PATCH_SHA" >/dev/null
+          fi
+          echo "Tag ${TARGET_TAG} points at ${PATCH_SHA}"
 
       - name: Compose release notes
         id: notes
@@ -293,6 +305,8 @@ jobs:
           TARGET_TAG: ${{ steps.plan.outputs.target_tag }}
           VERSION: ${{ steps.plan.outputs.version }}
           IS_PRERELEASE: ${{ steps.plan.outputs.is_prerelease }}
+          UPSTREAM_SHA: ${{ steps.patch.outputs.upstream_sha }}
+          PATCH_SHA: ${{ steps.tag.outputs.patch_sha }}
         run: |
           echo "compose_notes" > "$RUNNER_TEMP/failed_stage"
           NOTES_FILE="$RUNNER_TEMP/release-notes.md"
@@ -312,6 +326,8 @@ jobs:
             printf '%s\n\n' "<!-- tinycast:install -->"
             printf '**Channel:** %s · **Version:** %s · **Bundle ID:** `%s`\n' "$CHANNEL" "$VERSION" "com.tinycast.app"
             printf 'Synced from upstream [abue-ammar/tinycast@%s](https://github.com/abue-ammar/tinycast/releases/tag/%s) with deterministic downstream patches.\n\n' "$TARGET_TAG" "$TARGET_TAG"
+            printf 'Built from upstream commit [`%s`](https://github.com/abue-ammar/tinycast/commit/%s) with the patches and pipeline of [`%s`](https://github.com/%s/commit/%s).\n\n' "$UPSTREAM_SHA" "$UPSTREAM_SHA" "$PATCH_SHA" "$GITHUB_REPOSITORY" "$PATCH_SHA"
+            printf '`Tinycast-%s-Source.tar.gz` is the tree this build was made from: upstream at that commit with every `patches/` entry applied.\n\n' "$VERSION"
             printf '**Recommended:** install via Homebrew:\n'
             printf '```sh\nbrew install --cask shelken/tap/tinycast\n```\n\n'
             printf 'This build is self-signed. If you download the DMG directly instead of using Homebrew, macOS will refuse to open it until you clear the quarantine flag once:\n'
@@ -340,6 +356,7 @@ jobs:
             gh release upload "$TARGET_TAG" \
               "$GITHUB_WORKSPACE/dist/Tinycast-${VERSION}.dmg" \
               "$GITHUB_WORKSPACE/dist/Tinycast-${VERSION}.zip" \
+              "$GITHUB_WORKSPACE/dist/Tinycast-${VERSION}-Source.tar.gz" \
               --repo "$GITHUB_REPOSITORY" \
               --clobber || true
           else
@@ -347,6 +364,7 @@ jobs:
             gh release create "$TARGET_TAG" \
               "$GITHUB_WORKSPACE/dist/Tinycast-${VERSION}.dmg" \
               "$GITHUB_WORKSPACE/dist/Tinycast-${VERSION}.zip" \
+              "$GITHUB_WORKSPACE/dist/Tinycast-${VERSION}-Source.tar.gz" \
               --repo "$GITHUB_REPOSITORY" \
               --title "Tinycast ${VERSION}" \
               --notes-file "$NOTES_FILE" \
@@ -411,7 +429,7 @@ jobs:
           BODY="$(printf '## Upstream Sync Failure: `%s`\n\n- **Failed Stage:** `%s`\n- **Upstream Release:** https://github.com/abue-ammar/tinycast/releases/tag/%s\n- **Upstream SHA:** `%s`\n- **Actions Run URL:** %s\n' \
             "$TARGET_TAG" "$FAILED_STAGE" "$TARGET_TAG" "$UPSTREAM_SHA" "$RUN_URL")"
 
-          BODY="$(printf '%s\n\n### Remediation:\n1. Check why the patch failed to apply or why the build failed.\n2. In local repo: `git checkout %s && git apply patches/*.patch` to reproduce.\n3. Update patch in `patches/` if upstream code changed.\n4. Commit to fork `main`.\n5. Re-run this workflow.\n' "$BODY" "$TARGET_TAG")"
+          BODY="$(printf '%s\n\n### Remediation:\n1. Check why the patch failed to apply or why the build failed.\n2. In local repo: `git fetch upstream --tags && git checkout %s && git apply patches/*.patch` to reproduce.\n3. Update patch in `patches/` if upstream code changed.\n4. Commit to fork `main`.\n5. Re-run this workflow.\n' "$BODY" "$UPSTREAM_SHA")"
 
           EXISTING_ISSUE="$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --search "\"${ISSUE_TITLE}\" in:title" --json number --jq '.[0].number // empty' 2>/dev/null || true)"
 
