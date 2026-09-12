@@ -271,8 +271,9 @@ jobs:
           ditto -c -k --keepParent --sequesterRsrc "$APP" "$GITHUB_WORKSPACE/dist/Tinycast-${VERSION}.zip"
           rm -rf "$STAGE"
 
-          # Ship the tree the binary came from: upstream plus patches, no history.
+          # Ship the app source the binary came from: upstream plus patches, website/ dropped.
           cd "$RUNNER_TEMP/build"
+          rm -rf website
           git add -u
           git archive --format=tar.gz --prefix="Tinycast-${VERSION}/" \
             -o "$GITHUB_WORKSPACE/dist/Tinycast-${VERSION}-Source.tar.gz" "$(git write-tree)"
@@ -327,7 +328,7 @@ jobs:
             printf '**Channel:** %s · **Version:** %s · **Bundle ID:** `%s`\n' "$CHANNEL" "$VERSION" "com.tinycast.app"
             printf 'Synced from upstream [abue-ammar/tinycast@%s](https://github.com/abue-ammar/tinycast/releases/tag/%s) with deterministic downstream patches.\n\n' "$TARGET_TAG" "$TARGET_TAG"
             printf 'Built from upstream commit [`%s`](https://github.com/abue-ammar/tinycast/commit/%s) with the patches and pipeline of [`%s`](https://github.com/%s/commit/%s).\n\n' "$UPSTREAM_SHA" "$UPSTREAM_SHA" "$PATCH_SHA" "$GITHUB_REPOSITORY" "$PATCH_SHA"
-            printf '`Tinycast-%s-Source.tar.gz` is the tree this build was made from: upstream at that commit with every `patches/` entry applied.\n\n' "$VERSION"
+            printf '`Tinycast-%s-Source.tar.gz` is the app source this build was made from: upstream at that commit with every `patches/` entry applied. The `website/` subproject is not included.\n\n' "$VERSION"
             printf '**Recommended:** install via Homebrew:\n'
             printf '```sh\nbrew install --cask shelken/tap/tinycast\n```\n\n'
             printf 'This build is self-signed. If you download the DMG directly instead of using Homebrew, macOS will refuse to open it until you clear the quarantine flag once:\n'
