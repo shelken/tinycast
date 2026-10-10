@@ -59,4 +59,4 @@ gh workflow run sync-upstream-release.yml -R shelken/tinycast
 
 同一套纪律。补丁必须带测试：上游不收的改动，测试是唯一守门人
 
-**被拒收的改动要按其评审要求组织代码**。`01-support-soft-link.patch` 曾作为上游 PR #458 提交，maintainer 以性能退化拒收并明说只能放 fork；评审时要求符号链接逻辑只走 fallback、不污染快路径。这类约束不写进 patch，下次重做会重新踩一遍
+**被拒收的改动要按其评审要求组织代码**。补丁 `01-support-soft-link.patch` 曾作为上游 PR #458 提交，maintainer 以性能退化拒收；但在 `v0.11.19` 中，上游通过 PR #1482 正式原生实现了目录与应用符号链接支持，该补丁已相应退役。对于未来新的下游补丁，若上游已支持或重新接纳，应及时删除补丁，避免维护沉淀债务。

@@ -60,8 +60,9 @@ worktree, so it has to stay context-clean against upstream's copy of the file it
 
 | Patch | Touches | Why it exists |
 | --- | --- | --- |
-| `01-support-soft-link.patch` | `Tinycast/Features/Launcher/Model/SearchScopes.swift`, `Tests/scopes-test.swift` | Upstream's app scan walks real folders only, so apps that a dotfiles manager keeps behind symlinks in `~/Applications` never show up. The patch descends through symlinked folders and symlinked `.app` bundles while keeping logical paths, and covers that with tests. |
 | `02-release-feed.patch` | `Tinycast/Features/Updates/Model/ReleaseFeed.swift` | Points `ReleaseFeed.repository` at `shelken/tinycast`, so the in-app update check reads this fork's releases. |
+
+> Upstream natively supports directory and application symlinks as of `v0.11.19` (via PR #1482), so `01-support-soft-link.patch` has been retired.
 
 To rebuild a published version by hand:
 
