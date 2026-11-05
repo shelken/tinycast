@@ -23,13 +23,13 @@ permissions:
 
 jobs:
   sync:
-    runs-on: macos-26
+    runs-on: xcode-27
     steps:
-      - name: Select Xcode 26
+      - name: Select Xcode 27
         run: |
-          XCODE_PATH="$(ls -d /Applications/Xcode_26*.app 2>/dev/null | sort -V | tail -n1)"
+          XCODE_PATH="$(find -E /Applications -maxdepth 1 -type d -regex '.*/Xcode_27(\.[0-9]+)*\.app' | sort -V | tail -n1)"
           if [ -z "$XCODE_PATH" ]; then
-            echo "::error::No Xcode 26.x found on this runner. Installed Xcodes:"
+            echo "::error::No released Xcode 27.x found on this runner. Installed Xcodes:"
             ls /Applications | grep -i xcode || true
             exit 1
           fi
