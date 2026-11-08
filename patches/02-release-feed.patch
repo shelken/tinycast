@@ -1,11 +1,23 @@
+diff --git a/Tests/updates-test.swift b/Tests/updates-test.swift
+index 68493ab7..f3e8e478 100644
+--- a/Tests/updates-test.swift
++++ b/Tests/updates-test.swift
+@@ -18,6 +18,7 @@ struct UpdatesTests {
+     }
+ 
+     static func main() {
++        expect(ReleaseFeed.repository == "shelken/tinycast", "updates come from the fork")
+         parsesVersions()
+         ordersVersions()
+         roundTripsVersionsThroughJSON()
 diff --git a/Tinycast/Features/Updates/Model/ReleaseFeed.swift b/Tinycast/Features/Updates/Model/ReleaseFeed.swift
-index 7fc0143..f7433ba 100644
+index d80800b9..0f373b23 100644
 --- a/Tinycast/Features/Updates/Model/ReleaseFeed.swift
 +++ b/Tinycast/Features/Updates/Model/ReleaseFeed.swift
-@@ -13,7 +13,7 @@ struct AvailableRelease: Codable, Hashable, Sendable {
+@@ -11,7 +11,7 @@ struct AvailableRelease: Codable, Hashable, Sendable {
+ 
  /// Nothing throws: an unusable body means nothing to install, and the pump retries.
  enum ReleaseFeed {
-     /// Where releases come from, and what every `@handle` and `#304` in their notes points at.
 -    static let repository = "abue-ammar/tinycast"
 +    static let repository = "shelken/tinycast"
  
